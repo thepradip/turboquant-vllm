@@ -20,11 +20,42 @@ Usage:
 import subprocess, os, re, time, json, sys
 
 BONSAI_DIR = "/Users/pradip/Desktop/Learning/Claude/PrismML/Bonsai-demo"
-LLAMA_CLI = os.path.join(BONSAI_DIR, "bin", "mac", "llama-cli")
-DYLD = os.path.join(BONSAI_DIR, "bin", "mac")
+DEFAULT_CLI = os.path.join(BONSAI_DIR, "bin", "mac", "llama-cli")
+DEFAULT_DYLD = os.path.join(BONSAI_DIR, "bin", "mac")
+
+# Model registry: name -> (gguf_path, llama_cli, dyld, prompt_template)
+MODEL_REGISTRY = {
+    "Bonsai-8B": (
+        os.path.join(BONSAI_DIR, "models", "Bonsai-8B.gguf"),
+        DEFAULT_CLI, DEFAULT_DYLD,
+        "<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n",
+    ),
+    "Bonsai-4B": (
+        os.path.join(BONSAI_DIR, "models", "Bonsai-4B.gguf"),
+        DEFAULT_CLI, DEFAULT_DYLD,
+        "<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n",
+    ),
+    "Qwen3.5-9B": (
+        "/Users/pradip/.cache/lm-studio/models/Jackrong/Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-GGUF/Qwen3.5-9B.Q4_K_M.gguf",
+        DEFAULT_CLI, DEFAULT_DYLD,
+        "<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n",
+    ),
+}
 
 MODEL_NAME = sys.argv[1] if len(sys.argv) > 1 else "Bonsai-8B"
-MODEL = os.path.join(BONSAI_DIR, "models", f"{MODEL_NAME}.gguf")
+if MODEL_NAME in MODEL_REGISTRY:
+    MODEL, LLAMA_CLI, DYLD, PROMPT_TPL = MODEL_REGISTRY[MODEL_NAME]
+elif os.path.exists(MODEL_NAME):
+    MODEL = MODEL_NAME
+    MODEL_NAME = os.path.basename(MODEL).replace(".gguf", "")
+    LLAMA_CLI = DEFAULT_CLI
+    DYLD = DEFAULT_DYLD
+    PROMPT_TPL = "<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n"
+else:
+    MODEL = os.path.join(BONSAI_DIR, "models", f"{MODEL_NAME}.gguf")
+    LLAMA_CLI = DEFAULT_CLI
+    DYLD = DEFAULT_DYLD
+    PROMPT_TPL = "<|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n"
 
 KV_CONFIGS = [
     {"name": "f16",  "ctk": "f16",  "ctv": "f16",  "label": "FP16 baseline"},
@@ -125,7 +156,7 @@ QA = [
 
 
 def run_llama(question, ctk="f16", ctv="f16", max_tok=400, ctx=8192):
-    prompt = f"<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    prompt = PROMPT_TPL.format(q=question)
     cmd = [
         LLAMA_CLI, "-m", MODEL, "-ngl", "999", "-fa", "1",
         "-c", str(ctx), "-ctk", ctk, "-ctv", ctv,
