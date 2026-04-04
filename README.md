@@ -13,25 +13,25 @@ Combines Google's TurboQuant (PolarQuant + QJL), KIVI asymmetric quantization, a
 Bonsai 1-bit models compress weights from 16 GB to 1.15 GB (14x) -- but the **KV cache stays in FP16**. At long context, the KV cache dominates memory:
 
 ```
-                    Bonsai-8B at 32K context (vLLM, FP16 KV cache)
-                    ──────────────────────────────────────────────
-  Model weights:    █                                     1,099 MB  (1-bit Q1_0_g128)
-  KV cache:         █████████████████████████              4,608 MB  (FP16 -- the bottleneck)
-  Compute buffers:  ░                                       304 MB
-                    ──────────────────────────────────────────────
-  Total:                                                  ~6.0 GB
+  Bonsai-8B at 32K context (FP16 KV cache)         each █ = ~300 MB
+
+  Model weights:    ████                              1,099 MB  (1-bit Q1_0_g128)
+  KV cache:         ████████████████                  4,608 MB  (FP16 -- the bottleneck)
+  Compute buffers:  █                                   304 MB
+                    ──────────────────────────────────────────
+  Total:            █████████████████████              6,011 MB
 ```
 
-TurboQuant compresses that 4.6 GB KV cache down to **1.2 GB at 4-bit** with zero quality loss on production tasks:
+TurboQuant compresses that 4.6 GB KV cache down to **1.2 GB at 4-bit** with zero quality loss:
 
 ```
-                    Bonsai-8B at 32K context + TurboQuant 4-bit KV
-                    ──────────────────────────────────────────────
-  Model weights:    █                                     1,099 MB  (1-bit, unchanged)
-  KV cache:         ██████                                1,182 MB  (4-bit, 3.9x compressed)
-  Compute buffers:  ░                                       304 MB
-                    ──────────────────────────────────────────────
-  Total:                                                  ~2.6 GB  (57% less)
+  Bonsai-8B at 32K context (4-bit KV cache)         each █ = ~300 MB
+
+  Model weights:    ████                              1,099 MB  (1-bit, unchanged)
+  KV cache:         ████                              1,182 MB  (4-bit, 3.9x compressed)
+  Compute buffers:  █                                   304 MB
+                    ──────────────────────────────────────────
+  Total:            █████████                         2,585 MB  (57% less)
 ```
 
 **Bonsai handles weights; TurboQuant handles the KV cache. Together they minimize total inference memory.**
@@ -108,28 +108,26 @@ Quality stable from 1K to 32K -- zero degradation with context length.
 ### Total Memory Breakdown: Model + KV Cache
 
 ```
-Bonsai-8B (1-bit weights) at various context lengths:
+Bonsai-8B total memory (model + KV cache)          each █ = 1 GB
 
-           Model Weights (fixed)    KV Cache              Total
-           ─────────────────────    ──────────────────    ──────────
-  FP16 KV:
-    4K     ██ 1.1 GB               █ 0.6 GB              1.7 GB
-   16K     ██ 1.1 GB               █████ 2.3 GB          3.4 GB
-   32K     ██ 1.1 GB               ██████████ 4.6 GB     5.7 GB
-   64K     ██ 1.1 GB               ████████████████████   10.3 GB
-  128K     ██ 1.1 GB               ████████████████████   19.5 GB
+  FP16 KV cache:
+    4K     ██                                         1.7 GB
+   16K     ███░                                       3.4 GB
+   32K     ██████                                     5.7 GB
+   64K     ██████████░                               10.3 GB
+  128K     ████████████████████                      19.5 GB
 
-  4-bit KV:
-    4K     ██ 1.1 GB               ░ 0.15 GB             1.25 GB
-   16K     ██ 1.1 GB               █░ 0.6 GB             1.8 GB
-   32K     ██ 1.1 GB               ███ 1.2 GB            2.6 GB
-   64K     ██ 1.1 GB               ██████ 2.4 GB         3.9 GB
-  128K     ██ 1.1 GB               █████████████ 5.5 GB  6.6 GB
+  4-bit KV cache (TurboQuant):
+    4K     █░                                         1.3 GB
+   16K     ██                                         1.8 GB
+   32K     ███                                        2.6 GB
+   64K     ████                                       3.9 GB
+  128K     ███████                                    6.6 GB
 
-Qwen3.5-9B (Q4_K_M weights) at 32K context:
+Qwen3.5-9B total memory at 32K context:
 
-  FP16 KV: ████████████ 5.2 GB  +  ██████████ 4.6 GB  =  9.8 GB
-  4-bit KV: ████████████ 5.2 GB  +  ███ 1.2 GB        =  6.4 GB  (35% less)
+  FP16 KV: ██████████                                9.8 GB  (5.2 model + 4.6 KV)
+  4-bit KV: ██████░                                   6.4 GB  (5.2 model + 1.2 KV)
 ```
 
 ### KV Cache Memory Savings (Bonsai-8B + TurboQuant)
