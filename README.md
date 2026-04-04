@@ -19,7 +19,7 @@ Bonsai 1-bit models compress weights from 16 GB to 1.15 GB (14x) -- but the **KV
   KV cache:         ████████████████                  4,608 MB  (FP16 -- the bottleneck)
   Compute buffers:  █                                   304 MB
                     ──────────────────────────────────────────
-  Total:            █████████████████████              6,011 MB
+  Total:            ████████████████████               6,011 MB
 ```
 
 TurboQuant compresses that 4.6 GB KV cache down to **1.2 GB at 4-bit** with zero quality loss:
