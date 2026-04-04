@@ -36,8 +36,6 @@ git clone https://github.com/thepradip/turboquant-vllm.git
 cd turboquant-vllm
 ```
 
-<img width="750" alt="terminal-clone" src="https://github.com/user-attachments/assets/placeholder-clone">
-
 ```
 pradip@Pradips-MBP ~ % git clone https://github.com/thepradip/turboquant-vllm.git
 Cloning into 'turboquant-vllm'...
