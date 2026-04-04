@@ -166,6 +166,63 @@ class TestTurboQuantizer:
         assert loaded.enable_polar_quant == config_4bit.enable_polar_quant
         assert loaded.head_dim == config_4bit.head_dim
 
+    # -- TurboQuant 3-bit with QJL tests --
+
+    def test_3bit_qjl_encode_decode_keys(self):
+        """3-bit with QJL should encode/decode keys with quality."""
+        config = TurboQuantConfig.turbo_3bit(
+            num_heads=8, num_kv_heads=4, head_dim=64
+        )
+        quantizer = TurboQuantizer(config)
+        torch.manual_seed(42)
+        keys = torch.randn(2, 8, 4, 64)
+        q_keys, meta = quantizer.encode_keys(keys)
+        assert "qjl_signs" in meta
+        recon = quantizer.decode_keys(q_keys, meta)
+        assert recon.shape == keys.shape
+        assert not torch.isnan(recon).any()
+
+    def test_3bit_qjl_encode_decode_values(self):
+        """3-bit with QJL should encode/decode values."""
+        config = TurboQuantConfig.turbo_3bit(
+            num_heads=8, num_kv_heads=4, head_dim=64
+        )
+        quantizer = TurboQuantizer(config)
+        torch.manual_seed(42)
+        values = torch.randn(2, 8, 4, 64)
+        q_vals, meta = quantizer.encode_values(values)
+        recon = quantizer.decode_values(q_vals, meta)
+        assert recon.shape == values.shape
+
+    def test_3bit_qjl_quality(self):
+        """3-bit QJL-corrected should maintain reasonable quality."""
+        config = TurboQuantConfig.turbo_3bit(
+            num_heads=8, num_kv_heads=4, head_dim=64
+        )
+        quantizer = TurboQuantizer(config)
+        torch.manual_seed(42)
+        keys = torch.randn(1, 32, 4, 64)
+        q_keys, meta = quantizer.encode_keys(keys)
+        recon = quantizer.decode_keys(q_keys, meta)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            keys.reshape(-1, 64), recon.reshape(-1, 64), dim=-1
+        )
+        assert cos_sim.mean() > 0.85, f"3-bit QJL cosine sim: {cos_sim.mean():.4f}"
+
+    # -- Device transfer tests --
+
+    def test_to_device_cpu(self, config_4bit):
+        """Quantizer.to() should move components to target device."""
+        quantizer = TurboQuantizer(config_4bit)
+        quantizer = quantizer.to("cpu")
+        assert quantizer.device == "cpu"
+        # Should still work after device transfer
+        torch.manual_seed(42)
+        keys = torch.randn(1, 4, 4, 64)
+        q, meta = quantizer.encode_keys(keys)
+        recon = quantizer.decode_keys(q, meta)
+        assert recon.shape == keys.shape
+
     # -- No NaN/Inf tests --
 
     def test_no_nan_inf_4bit(self, config_4bit):
