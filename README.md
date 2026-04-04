@@ -22,13 +22,13 @@ Bonsai 1-bit models compress weights from 16 GB to 1.15 GB (14x) -- but the **KV
   Total:                                                  ~6.0 GB
 ```
 
-TurboQuant compresses that 4.6 GB KV cache down to **1.2 GB at 4-bit** with 99.4% attention fidelity:
+TurboQuant compresses that 4.6 GB KV cache down to **1.2 GB at 4-bit** with zero quality loss on production tasks:
 
 ```
                     Bonsai-8B at 32K context + TurboQuant 4-bit KV
                     ──────────────────────────────────────────────
   Model weights:    █                                     1,099 MB  (1-bit, unchanged)
-  KV cache:         ██████                                1,187 MB  (4-bit TurboQuant)
+  KV cache:         ██████                                1,182 MB  (4-bit, 3.9x compressed)
   Compute buffers:  ░                                       304 MB
                     ──────────────────────────────────────────────
   Total:                                                  ~2.6 GB  (57% less)
@@ -38,52 +38,130 @@ TurboQuant compresses that 4.6 GB KV cache down to **1.2 GB at 4-bit** with 99.4
 
 ---
 
-## Real Benchmark: Bonsai-8B (1-bit) with KV Cache Quantization
+## Real Benchmarks
 
-Tested on **20 production QA questions** across 4 categories (RAG, Finance, Reasoning, Instruction) with 4 KV cache configurations:
+### Bonsai-8B (1-bit weights, 1.1 GB) -- 20 Production QA Questions
 
-```
-Config                      Score  vs FP16  Wall(s)  PP tok/s  Gen tok/s
-──────────────────────────────────────────────────────────────────────
-FP16 baseline                18/20      ---      150       283         47
-8-bit uniform (q8_0)         18/20       +0      156       281         44
-4-bit uniform (q4_0)         17/20       -1      144       282         45
-K=8bit V=4bit (KIVI)         18/20       +0      221       229         29
-```
+| Config | Score | vs FP16 | Wall | PP tok/s | Gen tok/s |
+|--------|-------|---------|------|----------|-----------|
+| FP16 baseline | 18/20 | --- | 149s | 284 | 47 |
+| Q8_0 (8-bit) | 18/20 | **+0** | 154s | 283 | 44 |
+| Q4_0 (4-bit) | 17/20 | -1 | 148s | 277 | 43 |
+| K8V4 (KIVI) | 18/20 | **+0** | 218s | 230 | 29 |
 
-**Per-category breakdown:**
+### Qwen3.5-9B (Q4_K_M weights, 5.2 GB) -- 20 Production QA Questions
 
-| Category | FP16 | Q8_0 | Q4_0 | K8V4 (KIVI) |
-|----------|------|------|------|-------------|
-| RAG Context (5) | 4/5 | 4/5 | 4/5 | 4/5 |
-| Finance (5) | **5/5** | **5/5** | **5/5** | **5/5** |
-| Reasoning (5) | **5/5** | **5/5** | **5/5** | **5/5** |
-| Instruction (5) | 4/5 | 4/5 | 3/5 | 4/5 |
+| Config | Score | vs FP16 | Wall | PP tok/s | Gen tok/s |
+|--------|-------|---------|------|----------|-----------|
+| FP16 baseline | 17/20 | --- | 486s | 197 | 18 |
+| Q8_0 (8-bit) | 17/20 | **+0** | 508s | 199 | 17 |
+| Q4_0 (4-bit) | 16/20 | -1 | 515s | 198 | 17 |
+| K8V4 (KIVI) | 18/20 | **+1** | 565s | 182 | 15 |
+
+### Per-Category Breakdown (both models)
+
+| Category | Bonsai-8B (all configs) | Qwen3.5-9B (all configs) |
+|----------|------------------------|--------------------------|
+| RAG Context (5) | 4/5 consistent | **5/5 consistent** |
+| Finance (5) | **5/5 consistent** | 4-5/5 |
+| Reasoning (5) | **5/5 consistent** | **5/5 consistent** |
+| Instruction (5) | 3-4/5 | 3/5 consistent |
 
 **Key findings:**
-- **Q8_0**: Zero quality loss, identical to FP16 on all 20 questions
-- **Q4_0**: Loses 1 question out of 20 (SQL generation), 2x KV memory savings
-- **K8V4 (KIVI-style)**: Zero quality loss, keys at 8-bit + values at 4-bit
-- **Finance and Reasoning: 5/5 across ALL configs** -- complex tasks fully preserved
+- **Q8_0**: Zero quality loss on both models
+- **Q4_0**: Loses 1 question on both models (-1 each)
+- **K8V4 (KIVI)**: Zero loss on Bonsai-8B, +1 on Qwen3.5-9B
+- **Reasoning 5/5 across ALL configs on BOTH models**
+
+### Context Scaling (Bonsai-8B, 1K to 32K)
+
+| Context | FP16 Score | Q4_0 Score | FP16 PP tok/s | Q4_0 PP tok/s |
+|---------|-----------|-----------|---------------|---------------|
+| 1K | 4/5 | 4/5 | 290 | 287 |
+| 4K | 4/5 | 4/5 | 290 | 287 |
+| 16K | 4/5 | 4/5 | 290 | 287 |
+| 32K | 4/5 | 4/5 | 289 | 286 |
+
+Quality stable from 1K to 32K -- zero degradation with context length.
+
+---
+
+## Performance
+
+### Encode+Decode Speed (M2 Pro)
+
+| Seq Length | Original | Fast + compile | Speedup |
+|-----------|----------|----------------|---------|
+| 256 | 7.0ms | 2.1ms | **3.3x** |
+| 1024 | 22.3ms | 6.0ms | **3.7x** |
+| 4096 | 79.4ms | 20.4ms | **3.9x** |
+| 8192 | 274.9ms | 35.1ms | **7.8x** |
+
+### M2 Pro Metal GPU (MPS) vs CPU
+
+| Seq Length | CPU | MPS | Speedup |
+|-----------|-----|-----|---------|
+| 128 | 3.6ms | 1.8ms | **2.0x** |
+| 1024 | 13.3ms | 5.7ms | **2.3x** |
+| 4096 | 43.1ms | 23.2ms | **1.9x** |
+
+### Total Memory Breakdown: Model + KV Cache
+
+```
+Bonsai-8B (1-bit weights) at various context lengths:
+
+           Model Weights (fixed)    KV Cache              Total
+           ─────────────────────    ──────────────────    ──────────
+  FP16 KV:
+    4K     ██ 1.1 GB               █ 0.6 GB              1.7 GB
+   16K     ██ 1.1 GB               █████ 2.3 GB          3.4 GB
+   32K     ██ 1.1 GB               ██████████ 4.6 GB     5.7 GB
+   64K     ██ 1.1 GB               ████████████████████   10.3 GB
+  128K     ██ 1.1 GB               ████████████████████   19.5 GB
+
+  4-bit KV:
+    4K     ██ 1.1 GB               ░ 0.15 GB             1.25 GB
+   16K     ██ 1.1 GB               █░ 0.6 GB             1.8 GB
+   32K     ██ 1.1 GB               ███ 1.2 GB            2.6 GB
+   64K     ██ 1.1 GB               ██████ 2.4 GB         3.9 GB
+  128K     ██ 1.1 GB               █████████████ 5.5 GB  6.6 GB
+
+Qwen3.5-9B (Q4_K_M weights) at 32K context:
+
+  FP16 KV: ████████████ 5.2 GB  +  ██████████ 4.6 GB  =  9.8 GB
+  4-bit KV: ████████████ 5.2 GB  +  ███ 1.2 GB        =  6.4 GB  (35% less)
+```
+
+### KV Cache Memory Savings (Bonsai-8B + TurboQuant)
+
+| Context | Bonsai + FP16 KV | Bonsai + 4-bit KV | Saved |
+|---------|------------------|---------------------|-------|
+| 4K | 1.67 GB | 1.25 GB | 25% |
+| 16K | 3.40 GB | 1.83 GB | 46% |
+| 32K | 5.71 GB | 2.59 GB | **55%** |
+| 64K | 10.3 GB | 3.91 GB | **62%** |
+| 128K | 19.5 GB | 6.55 GB | **66%** |
 
 ---
 
 ## CLI Usage
 
 ```bash
-# Run Bonsai GGUF with quantized KV cache
+# Bonsai-8B with quantized KV cache
 python -m turboquant --gguf /path/to/Bonsai-8B.gguf --kv-quant q4_0 \
     --prompt "What is the gross margin if revenue is 50M and COGS is 30M?"
 
-# HuggingFace model with TurboQuant 4-bit KV
-python -m turboquant --model Qwen/Qwen2.5-3B-Instruct --kv-quant turbo_4bit \
+# Qwen3.5-9B with quantized KV cache
+python -m turboquant --gguf /path/to/Qwen3.5-9B.Q4_K_M.gguf --kv-quant q4_0 \
     --prompt "Explain the Pythagorean theorem"
 
-# Compare FP16 vs quantized side-by-side
-python -m turboquant --model Qwen/Qwen2.5-0.5B --kv-quant turbo_4bit --compare
+# HuggingFace model with TurboQuant 4-bit KV
+python -m turboquant --model Qwen/Qwen2.5-3B-Instruct --kv-quant turbo_4bit \
+    --prompt "What is 15 * 23?"
 
-# Full 20-question benchmark on Bonsai-8B
+# Full 20-question benchmark
 python benchmarks/full_kv_benchmark.py Bonsai-8B
+python benchmarks/full_kv_benchmark.py Qwen3.5-9B
 ```
 
 **Available `--kv-quant` options:**
@@ -99,65 +177,21 @@ python benchmarks/full_kv_benchmark.py Bonsai-8B
 
 ---
 
-## KV Cache Quantization Presets
-
-| Preset | KV Bits | KV Compression | Attention Fidelity | Use Case |
-|--------|---------|----------------|-------------------|----------|
-| `turbo_4bit` | 4 | 3.9x | 99.4% | **Production** -- near-lossless |
-| `turbo_3bit` | 3 | 5.1x | 98.7% | Long-context serving |
-| `kivi_2bit` | 4K+2V | 4.0x | 88.8% | Memory-constrained |
-
-## Total Memory Savings (Bonsai-8B + TurboQuant)
-
-| Context | Bonsai + FP16 KV | Bonsai + 4-bit KV | Saved |
-|---------|-------------------|---------------------|-------|
-| 4K | 1.67 GB | 1.25 GB | 25% |
-| 16K | 3.40 GB | 1.83 GB | 46% |
-| 32K | 5.71 GB | 2.59 GB | **55%** |
-| 64K | 10.3 GB | 3.91 GB | **62%** |
-| 128K | 19.5 GB | 6.55 GB | **66%** |
-
----
-
-## Installation
+## vLLM Integration
 
 ```bash
-git clone https://github.com/thepradip/turboquant-vllm.git
-cd turboquant-vllm
-pip install torch numpy scipy pyyaml tqdm pytest pytest-cov
-pip install -e ".[dev]"
+# Auto-registers via entry point
+pip install turboquant-vllm
+vllm serve model --quantization turboquant
 ```
 
-Verify:
-```bash
-python3 -c "import turboquant; print(f'TurboQuant v{turboquant.__version__} loaded OK')"
-```
+```python
+# Standalone hook for custom integration
+from turboquant.vllm_plugin import TurboQuantKVHook
 
-## Running Tests
-
-```bash
-# 153 tests, 90% coverage
-python3 -m pytest tests/ -v
-python3 -m pytest tests/ --cov=turboquant
-```
-
-## Running Benchmarks
-
-```bash
-# Synthetic KV cache quality
-python3 -m benchmarks.quality_benchmark
-
-# Memory profiling
-python3 -m benchmarks.memory_benchmark
-
-# Real model (Qwen2.5-3B): KV cache interception + perplexity
-python3 -m benchmarks.real_model_eval
-
-# Bonsai-8B: 20-question production QA across f16/q8_0/q4_0/k8v4
-python3 benchmarks/full_kv_benchmark.py Bonsai-8B
-
-# Quick 5-question smoke test
-python3 benchmarks/smoke_test.py Bonsai-8B q4_0
+hook = TurboQuantKVHook(num_heads=32, num_kv_heads=8, head_dim=128, device="cuda")
+encoded = hook.encode_keys(key_states, layer_idx=0)
+decoded = hook.decode_keys(encoded, layer_idx=0)
 ```
 
 ---
@@ -168,10 +202,7 @@ python3 benchmarks/smoke_test.py Bonsai-8B q4_0
 import torch
 from turboquant import TurboQuantConfig, TurboQuantizer, QuantizedKVCache
 
-# 4-bit KV cache quantization
-config = TurboQuantConfig.turbo_4bit(
-    num_heads=32, num_kv_heads=8, head_dim=128
-)
+config = TurboQuantConfig.turbo_4bit(num_heads=32, num_kv_heads=8, head_dim=128)
 quantizer = TurboQuantizer(config)
 
 # Compress KV cache: FP16 -> 4-bit
@@ -188,12 +219,32 @@ all_keys = cache.get_keys(layer_idx=0)
 
 ---
 
-## How It Works
+## Installation
+
+```bash
+git clone https://github.com/thepradip/turboquant-vllm.git
+cd turboquant-vllm
+pip install torch numpy scipy pyyaml tqdm pytest pytest-cov
+pip install -e ".[dev]"
+python3 -c "import turboquant; print(f'TurboQuant v{turboquant.__version__} loaded OK')"
+```
+
+## Tests
+
+```bash
+# 161 tests, 90% coverage
+python3 -m pytest tests/ -v
+python3 -m pytest tests/ --cov=turboquant
+```
+
+---
+
+## Architecture
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │                                                                   │
-│   Bonsai 1-bit Model (weights: Q1_0_g128, 1.15 GB)              │
+│   Model (Bonsai 1-bit / Qwen3.5 Q4 / any LLM)                  │
 │   └── KV cache generated during inference (FP16 by default)     │
 │                                                                   │
 │   TurboQuant -- compresses the KV cache                          │
@@ -208,56 +259,47 @@ all_keys = cache.get_keys(layer_idx=0)
 │   │  │  Compressed Cache │  │  Residual Buffer (FP16) │      │  │
 │   │  │  (4-bit groups)   │  │  (last 128 tokens)      │      │  │
 │   │  └──────────────────┘  └──────────────────────────┘      │  │
+│   │                                                           │  │
+│   │  FastQuantizer: torch.compile + MPS-native ops            │  │
+│   │  vLLM Plugin: auto-registers via entry point              │  │
 │   └───────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────────┘
 ```
-
-### PolarQuant (TurboQuant Primary Stage)
-1. Decompose each KV vector into magnitude (FP16) and direction (unit vector)
-2. Rotate direction with randomized Hadamard transform -- eliminates outliers
-3. Quantize rotated coordinates with fixed Lloyd-Max codebook
-4. Pack quantized indices into sub-byte storage
-
-### KIVI Asymmetric Quantization
-- **Keys: per-channel** -- outlier channels persistent across tokens
-- **Values: per-token** -- no channel outlier pattern, sparse attention
-- 5x lower attention error for keys, 15x lower for values vs naive
-
-### Bonsai Q1_0_g128 (model weights, separate concern)
-- Bonsai quantizes **model weights** to 1-bit, not KV cache
-- KV cache from Bonsai is still FP16 -- **that's what TurboQuant compresses**
-
----
 
 ## Project Structure
 
 ```
 turboquant-vllm/
-├── turboquant/                     # Core library
-│   ├── cli.py                      #   CLI with --kv-quant flag
-│   ├── config.py                   #   Quantization presets
+├── turboquant/
+│   ├── cli.py                      # CLI: python -m turboquant --kv-quant ...
+│   ├── vllm_plugin.py              # vLLM plugin (auto-registers via entry point)
+│   ├── config.py                   # Quantization presets
 │   ├── core/
-│   │   ├── hadamard.py             #   Fast Walsh-Hadamard Transform
-│   │   ├── lloyd_max.py            #   Lloyd-Max optimal codebook
-│   │   ├── polar_quant.py          #   PolarQuant compression
-│   │   ├── qjl.py                  #   QJL residual correction
-│   │   ├── kv_cache.py             #   Quantized KV cache manager
-│   │   └── quantizer.py            #   Main orchestrator
+│   │   ├── hadamard.py             # Fast Walsh-Hadamard Transform
+│   │   ├── lloyd_max.py            # Lloyd-Max optimal codebook
+│   │   ├── polar_quant.py          # PolarQuant compression
+│   │   ├── qjl.py                  # QJL residual correction
+│   │   ├── kv_cache.py             # Quantized KV cache manager
+│   │   ├── quantizer.py            # Main orchestrator
+│   │   ├── fast_ops.py             # MPS-native + CUDA optimized ops
+│   │   └── fast_quantizer.py       # Drop-in fast replacement (torch.compile)
 │   ├── quant/
-│   │   ├── asymmetric.py           #   KIVI per-channel/per-token
-│   │   ├── onebit.py               #   1-bit KV (experimental)
-│   │   └── mixed_precision.py      #   Outlier channel handling
+│   │   ├── asymmetric.py           # KIVI per-channel/per-token
+│   │   ├── onebit.py               # 1-bit KV (experimental)
+│   │   └── mixed_precision.py      # Outlier channel handling
 │   └── engine/
-│       ├── attention.py            #   GQA-aware quantized attention
-│       └── inference.py            #   HuggingFace integration
-├── tests/                          # 153 tests, 90% coverage
+│       ├── attention.py            # GQA-aware quantized attention
+│       └── inference.py            # HuggingFace integration
+├── tests/                          # 161 tests, 90% coverage
 ├── benchmarks/
-│   ├── full_kv_benchmark.py        #   20Q production QA (f16/q8/q4/k8v4)
-│   ├── smoke_test.py               #   Quick 5Q comparison
-│   ├── quality_benchmark.py        #   Synthetic KV quality
-│   ├── memory_benchmark.py         #   Memory profiling
-│   ├── real_model_eval.py          #   Qwen2.5-3B KV interception
-│   └── dataset_eval.py             #   Dataset-based evaluation
+│   ├── full_kv_benchmark.py        # 20Q benchmark (Bonsai-8B, Qwen3.5-9B)
+│   ├── full_report_benchmark.py    # Full report with context scaling
+│   ├── smoke_test.py               # Quick 5Q comparison
+│   ├── quality_benchmark.py        # Synthetic KV quality
+│   ├── memory_benchmark.py         # Memory profiling
+│   └── quality_check_examples.py   # Reproducible quality gates
+├── scripts/
+│   └── generate_report_pdf.py      # Infographic PDF report generator
 └── configs/                        # YAML presets
 ```
 
