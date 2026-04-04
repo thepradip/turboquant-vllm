@@ -1,0 +1,48 @@
+# TurboQuant Default Configuration
+# 4-bit KV cache quantization with PolarQuant + Hadamard rotation
+
+kv_bits: 4
+key_bits: 4
+value_bits: 4
+
+# PolarQuant
+enable_polar_quant: true
+polar_quant_bits: 4
+codebook_size: 16
+
+# QJL (disabled by default -- community finding)
+enable_qjl: false
+qjl_projection_dim: 256
+qjl_bits: 1
+
+# Hadamard rotation
+enable_hadamard: true
+hadamard_block_size: 128
+
+# KIVI asymmetric
+enable_asymmetric: true
+key_quant_mode: per_channel
+value_quant_mode: per_token
+kivi_group_size: 32
+
+# Residual buffer
+residual_buffer_size: 128
+
+# Mixed precision
+enable_mixed_precision: true
+outlier_channel_fraction: 0.25
+outlier_bits: 8
+
+# 1-bit (disabled)
+enable_onebit: false
+onebit_group_size: 128
+
+# Model dimensions (Llama-3.1-8B defaults)
+num_heads: 32
+num_kv_heads: 8
+head_dim: 128
+max_seq_len: 65536
+
+# Runtime
+device: cpu
+dtype: float16

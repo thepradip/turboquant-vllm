@@ -1,0 +1,35 @@
+# TurboQuant Aggressive Configuration
+# 1-bit KV cache with Bonsai-style Q1_0_g128
+
+kv_bits: 1
+
+# PolarQuant disabled for 1-bit mode
+enable_polar_quant: false
+enable_qjl: false
+
+# Hadamard still useful for outlier redistribution
+enable_hadamard: true
+hadamard_block_size: 128
+
+# No asymmetric for 1-bit
+enable_asymmetric: false
+kivi_group_size: 32
+
+# Larger residual buffer to compensate for aggressive compression
+residual_buffer_size: 256
+
+# No mixed precision
+enable_mixed_precision: false
+
+# 1-bit enabled
+enable_onebit: true
+onebit_group_size: 128
+
+# Model dimensions
+num_heads: 32
+num_kv_heads: 8
+head_dim: 128
+max_seq_len: 65536
+
+device: cpu
+dtype: float16
