@@ -43,6 +43,9 @@ vllm = [
     "vllm>=0.4.0",
 ]
 
+[project.entry-points."vllm.general_plugins"]
+turboquant = "turboquant.vllm_plugin:register"
+
 [tool.setuptools.packages.find]
 include = ["turboquant*"]
 
