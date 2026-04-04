@@ -19,7 +19,7 @@ from typing import Optional
 from turboquant.config import TurboQuantConfig
 from turboquant.core.polar_quant import PolarQuant
 from turboquant.core.qjl import QJLProjection
-from turboquant.core.hadamard import HadamardTransform
+from turboquant.core.hadamard import HadamardTransform, pad_to_power_of_2, unpad
 from turboquant.quant.asymmetric import AsymmetricQuantizer
 from turboquant.quant.onebit import OneBitQuantizer
 from turboquant.quant.mixed_precision import MixedPrecisionQuantizer
@@ -48,6 +48,7 @@ class TurboQuantizer:
         # Initialize components based on config
         self._init_polar_quant()
         self._init_qjl()
+        self._init_hadamard()
         self._init_asymmetric()
         self._init_onebit()
         self._init_mixed_precision()
@@ -97,6 +98,16 @@ class TurboQuantizer:
                 group_size=self.config.onebit_group_size,
                 device=self.device,
             )
+
+    def _init_hadamard(self) -> None:
+        """Standalone Hadamard for 1-bit and other non-PolarQuant paths."""
+        self.hadamard: Optional[HadamardTransform] = None
+        if self.config.enable_hadamard and not self.config.enable_polar_quant:
+            dim = self.config.head_dim
+            padded = 1 << (dim - 1).bit_length() if dim & (dim - 1) != 0 else dim
+            self.hadamard = HadamardTransform(padded, device=self.device, seed=42)
+            self._hadamard_padded_dim = padded
+            self._hadamard_original_dim = dim
 
     def _init_mixed_precision(self) -> None:
         self.mixed_precision: Optional[MixedPrecisionQuantizer] = None
@@ -198,12 +209,25 @@ class TurboQuantizer:
     def _encode_onebit(
         self, x: torch.Tensor, meta: dict
     ) -> tuple[torch.Tensor, dict]:
-        """Encode using 1-bit Bonsai-style quantization."""
+        """Encode using 1-bit Bonsai-style quantization.
+
+        When Hadamard is enabled, rotates vectors first to eliminate outliers.
+        This redistributes large magnitudes across all channels, making the
+        sign-bit quantization much more effective (TurboQuant + Bonsai hybrid).
+        """
         batch, seq, heads, dim = x.shape
         x_flat = x.reshape(-1, dim)
+
+        # Apply Hadamard rotation to eliminate outliers before sign quantization
+        if self.hadamard is not None:
+            if dim != self._hadamard_padded_dim:
+                x_flat = torch.nn.functional.pad(x_flat, (0, self._hadamard_padded_dim - dim))
+            x_flat = self.hadamard.forward(x_flat)
+
         packed, scales = self.onebit.quantize(x_flat)
         meta["scales"] = scales.reshape(batch, seq, heads, -1)
         meta["original_shape"] = torch.tensor([batch, seq, heads, dim])
+        meta["hadamard_applied"] = self.hadamard is not None
         return packed.reshape(batch, seq, heads, -1), meta
 
     def decode_keys(
@@ -281,12 +305,26 @@ class TurboQuantizer:
             orig_shape = tuple(meta["original_shape"].tolist())
             batch, seq, heads, dim = orig_shape
         else:
-            # Infer shape from quantized tensor and config
             batch, seq, heads = quantized.shape[:3]
             dim = self.config.head_dim
         packed_flat = quantized.reshape(-1, quantized.shape[-1])
         scales = meta["scales"].reshape(-1, meta["scales"].shape[-1])
-        reconstructed = self.onebit.dequantize(packed_flat, scales, dim)
+
+        # Dequantize -- if Hadamard was applied, dequantize in rotated space first
+        hadamard_applied = meta.get("hadamard_applied", False)
+        if hadamard_applied and self.hadamard is not None:
+            dequant_dim = self._hadamard_padded_dim
+        else:
+            dequant_dim = dim
+
+        reconstructed = self.onebit.dequantize(packed_flat, scales, dequant_dim)
+
+        # Inverse Hadamard to recover original space
+        if hadamard_applied and self.hadamard is not None:
+            reconstructed = self.hadamard.inverse(reconstructed)
+            if dequant_dim != dim:
+                reconstructed = reconstructed[:, :dim]
+
         return reconstructed.reshape(batch, seq, heads, dim)
 
     def compute_compression_ratio(self, original_bytes: int) -> dict[str, float]:
@@ -319,4 +357,6 @@ class TurboQuantizer:
             self.polar_quant_value = self.polar_quant_value.to(device)
         if self.qjl:
             self.qjl = self.qjl.to(device)
+        if self.hadamard:
+            self.hadamard = self.hadamard.to(device)
         return self
