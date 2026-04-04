@@ -270,14 +270,31 @@ def build_pdf(output_path):
     ))
 
     story.append(Paragraph(
-        "Tested on Bonsai-8B (1-bit weights), Qwen2.5-3B, and Qwen2.5-0.5B with "
+        "Tested on Bonsai-8B (1-bit weights) and Qwen3.5-9B (Q4_K_M weights) with "
         "20 production QA questions across RAG, Finance, Reasoning, and Instruction categories.",
         s["body"]
     ))
 
-    # ── Page 2: Quality ──
+    # ── Page 2: Features ──
     story.append(PageBreak())
-    story.append(Paragraph("1. Quality: Zero Loss on Production Tasks", s["h1"]))
+    story.append(Paragraph("1. Features", s["h1"]))
+
+    features = [
+        ["Feature", "Description"],
+        ["PolarQuant (TurboQuant)", "Magnitude/direction decomposition + Hadamard rotation + Lloyd-Max codebook. Calibration-free, online, no per-block metadata."],
+        ["KIVI Asymmetric", "Per-channel key quantization (isolates outliers) + per-token value quantization (exploits sparse attention). 5x lower error for keys."],
+        ["Hadamard Rotation", "Fast Walsh-Hadamard O(d log d) eliminates outlier channels before quantization. Key enabler for all bit-widths."],
+        ["Mixed Precision", "Top 25% outlier channels at 8-bit, rest at 4-bit. Average 5 effective bits with better quality than uniform 5-bit."],
+        ["Residual Buffer", "Last 128 tokens in FP16, older tokens quantized. Preserves quality on recent context."],
+        ["FastQuantizer", "torch.compile + MPS-native ops. 3.3-7.8x speedup on CPU, 2x on M2 Pro Metal GPU."],
+        ["vLLM Plugin", "Auto-registers via pyproject.toml entry point. Also usable as standalone KV hook."],
+        ["CLI", "python -m turboquant --kv-quant for GGUF (llama.cpp) and HuggingFace models."],
+    ]
+    story.append(styled_table(features, col_widths=[40*mm, 118*mm]))
+
+    # ── Page 3: Quality ──
+    story.append(PageBreak())
+    story.append(Paragraph("2. Quality: Zero Loss on Production Tasks", s["h1"]))
     story.append(Paragraph(
         '"The key question: does 4-bit KV cache degrade the model\'s ability to reason, '
         'calculate, extract facts, and follow instructions? The answer is no."',
@@ -304,7 +321,7 @@ def build_pdf(output_path):
 
     # ── Page 3: Context + Models ──
     story.append(PageBreak())
-    story.append(Paragraph("2. Context Scaling & Multi-Model Validation", s["h1"]))
+    story.append(Paragraph("3. Context Scaling & Multi-Model Analysis", s["h1"]))
     story.append(Paragraph(
         '"Quality must hold from 1K to 32K tokens. A method that works at 1K but fails at 32K is useless for production."',
         s["quote"]
@@ -317,25 +334,35 @@ def build_pdf(output_path):
         s["insight"]
     ))
 
-    story.append(Paragraph("Per-Layer KV Quality (Qwen2.5-3B, 36 Layers)", s["h2"]))
-    story.append(chart_cosine_layers())
+    story.append(Paragraph("Qwen3.5-9B (Q4_K_M, 5.2 GB) -- Same 20 Questions", s["h2"]))
+    q2_data = [["Config", "Score", "vs FP16", "Wall", "PP tok/s", "Gen tok/s"]]
+    q2_data.append(["FP16 baseline", "17/20", "---", "486s", "197", "18"])
+    q2_data.append(["Q8_0 (8-bit)", "17/20", "+0", "508s", "199", "17"])
+    q2_data.append(["Q4_0 (4-bit)", "16/20", "-1", "515s", "198", "17"])
+    q2_data.append(["K8V4 (KIVI)", "18/20", "+1", "565s", "182", "15"])
+    story.append(styled_table(q2_data, col_widths=[38*mm, 20*mm, 18*mm, 18*mm, 25*mm, 25*mm]))
     story.append(Paragraph(
-        "Insight: Every single layer stays above 0.995 cosine similarity. "
-        "Worst layer: 0.9951. This is near-lossless across the entire model.",
+        "Insight: Same pattern on Qwen3.5-9B -- Q8_0 matches FP16, Q4_0 loses 1 question. "
+        "K8V4 actually gained 1 question (quantization noise as regularization). "
+        "RAG 5/5 and Reasoning 5/5 across all configs.",
         s["insight"]
     ))
 
-    story.append(Paragraph("Model Comparison", s["h2"]))
-    m_data = [["Model", "Layers", "KV Heads", "Key CosSim", "Val CosSim", "Key SNR"]]
-    m_data.append(["Bonsai-8B (GGUF)", "36", "8", "0.9984*", "0.9956*", "26.7 dB*"])
-    m_data.append(["Qwen2.5-3B (HF)", "36", "2", "0.9956", "0.9955", "20.5 dB"])
-    m_data.append(["Qwen2.5-0.5B (HF)", "24", "2", "0.9984", "0.9956", "26.7 dB"])
-    story.append(styled_table(m_data, col_widths=[35*mm, 15*mm, 18*mm, 25*mm, 25*mm, 22*mm]))
-    story.append(Paragraph("* Bonsai-8B metrics from synthetic KV matching model architecture (36L, 8KV, dim128)", s["body"]))
+    story.append(Spacer(1, 3*mm))
+    story.append(Paragraph("Top Results Across Models", s["h2"]))
+    top_data = [["Finding", "Bonsai-8B", "Qwen3.5-9B"]]
+    top_data.append(["FP16 baseline", "18/20", "17/20"])
+    top_data.append(["Best quantized", "18/20 (Q8, K8V4)", "18/20 (K8V4)"])
+    top_data.append(["Reasoning (all configs)", "5/5", "5/5"])
+    top_data.append(["Finance (all configs)", "5/5", "4-5/5"])
+    top_data.append(["Quality loss at Q4_0", "-1 question", "-1 question"])
+    top_data.append(["PP tok/s (FP16)", "284", "197"])
+    top_data.append(["Gen tok/s (FP16)", "47", "18"])
+    story.append(styled_table(top_data, col_widths=[45*mm, 45*mm, 45*mm]))
 
     # ── Page 4: Speed ──
     story.append(PageBreak())
-    story.append(Paragraph("3. Performance: 3-8x Speedup", s["h1"]))
+    story.append(Paragraph("4. Performance: 3-8x Speedup", s["h1"]))
     story.append(Paragraph(
         '"Fast enough to not be the bottleneck. At 4K tokens, '
         'encode+decode takes 20ms -- invisible next to 80ms of attention."',
@@ -353,7 +380,7 @@ def build_pdf(output_path):
 
     # ── Page 5: Memory ──
     story.append(PageBreak())
-    story.append(Paragraph("4. Memory Savings", s["h1"]))
+    story.append(Paragraph("5. Memory Savings", s["h1"]))
     story.append(Paragraph(
         '"At 128K context, TurboQuant saves 13 GB of KV cache memory. '
         'That\'s the difference between needing 2 GPUs and needing 1."',
@@ -374,13 +401,13 @@ def build_pdf(output_path):
     stats_data.append(["Lines of code", "7,545"])
     stats_data.append(["Tests", "161 (90% coverage)"])
     stats_data.append(["Quantization presets", "4 (4-bit, 3-bit, 2-bit, 1-bit)"])
-    stats_data.append(["Models tested", "Bonsai-8B, Qwen2.5-3B, Qwen2.5-0.5B"])
+    stats_data.append(["Models tested", "Bonsai-8B (1-bit), Qwen3.5-9B (Q4_K_M)"])
     stats_data.append(["Benchmark questions", "20 (RAG, Finance, Reasoning, Instruction)"])
     story.append(styled_table(stats_data, col_widths=[45*mm, 80*mm]))
 
     # ── Page 6: Future ──
     story.append(PageBreak())
-    story.append(Paragraph("5. Future Scope", s["h1"]))
+    story.append(Paragraph("6. Future Scope", s["h1"]))
 
     future = [
         ("Fused Attention Kernel", "Compute attention directly from 4-bit KV without materializing FP16. Eliminates the decode step entirely."),
@@ -404,7 +431,7 @@ def build_pdf(output_path):
 
     # ── Page 7: References ──
     story.append(PageBreak())
-    story.append(Paragraph("6. References", s["h1"]))
+    story.append(Paragraph("7. References", s["h1"]))
     refs_data = [["Paper", "Venue", "Key Contribution"]]
     refs_data.append(["TurboQuant", "ICLR 2026", "PolarQuant + QJL, calibration-free KV compression"])
     refs_data.append(["KIVI", "ICML 2024", "Asymmetric per-channel key / per-token value"])
