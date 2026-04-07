@@ -230,10 +230,12 @@ python3 -c "import turboquant; print(f'TurboQuant v{turboquant.__version__} load
 ## Tests
 
 ```bash
-# 161 tests, 90% coverage
+# 163 tests covering all quantization paths
 python3 -m pytest tests/ -v
 python3 -m pytest tests/ --cov=turboquant
 ```
+
+![Test Suite - 163 tests](assets/test_suite_163.png)
 
 ---
 

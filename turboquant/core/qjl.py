@@ -45,21 +45,27 @@ class QJLProjection:
             / math.sqrt(projection_dim)
         ).to(device)
 
-    def encode(self, residual: torch.Tensor) -> torch.Tensor:
+    def encode(self, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Project and sign-quantize residual vectors.
 
         Args:
             residual: Tensor of shape (..., input_dim) -- the error vectors
 
         Returns:
-            Sign-quantized projections of shape (..., projection_dim) as {-1, +1}
+            (signs, residual_norms):
+                signs: Sign-quantized projections (..., projection_dim) as {-1, +1}
+                residual_norms: L2 norms of residual vectors (...,) as FP16
         """
         proj_matrix = self.projection_matrix.to(residual.device)
+
+        # Store residual norms for proper scaling during decode
+        residual_norms = torch.norm(residual, dim=-1).to(torch.float16)
+
         projected = residual @ proj_matrix  # (..., projection_dim)
         # Sign quantization: +1 or -1
         signs = torch.sign(projected)
         signs[signs == 0] = 1  # Map zeros to +1
-        return signs
+        return signs, residual_norms
 
     def pack_signs(self, signs: torch.Tensor) -> torch.Tensor:
         """Pack sign bits into uint8 for storage efficiency.
@@ -85,15 +91,20 @@ class QJLProjection:
         unpacked = torch.stack(bits, dim=-1).reshape(-1)[:num_elements]
         return unpacked.float() * 2 - 1  # {0,1} -> {-1,+1}
 
-    def decode_correction(self, signs: torch.Tensor) -> torch.Tensor:
+    def decode_correction(
+        self, signs: torch.Tensor, residual_norms: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Compute approximate residual correction from sign bits.
 
-        The correction is: R^T @ signs * scale_factor
-        This provides an unbiased estimate of the original residual's
-        contribution to dot products.
+        The correction is: R^T @ signs * scale_factor * residual_norm
+        The residual norm is essential for proper magnitude reconstruction.
+        Without it, the correction direction is right but magnitude is wrong.
 
         Args:
             signs: Sign-quantized projections of shape (..., projection_dim)
+            residual_norms: L2 norms of original residuals (...,). If None,
+                falls back to the old heuristic (backward compatible with 4-bit
+                path that doesn't use QJL).
 
         Returns:
             Approximate residual correction of shape (..., input_dim)
@@ -101,8 +112,21 @@ class QJLProjection:
         proj_matrix = self.projection_matrix.to(signs.device)
         # Transpose projection to map back to input space
         correction = signs @ proj_matrix.T  # (..., input_dim)
-        # Scale factor: sqrt(projection_dim) to account for sign quantization variance
-        scale = math.sqrt(self.projection_dim) / self.projection_dim
+
+        # Normalize the correction direction, then scale by residual norm
+        # This is the unbiased estimator from the QJL paper:
+        #   correction_hat = ||residual|| * sqrt(2/pi) * (R^T @ signs) / ||R^T @ signs||
+        # sqrt(2/pi) accounts for sign quantization of Gaussian projections
+        correction_norm = torch.norm(correction, dim=-1, keepdim=True).clamp(min=1e-8)
+        correction = correction / correction_norm  # unit direction
+
+        if residual_norms is not None:
+            # Proper scaling: use actual residual magnitude
+            scale = residual_norms.float().unsqueeze(-1) * math.sqrt(2.0 / math.pi)
+        else:
+            # Fallback heuristic for backward compatibility
+            scale = math.sqrt(self.projection_dim) / self.projection_dim
+
         return correction * scale
 
     def compute_inner_product_estimate(

@@ -195,8 +195,9 @@ class TurboQuantizer:
         if self.qjl is not None:
             reconstructed = polar_quant.decode(encoded)
             residual = x_flat - reconstructed
-            qjl_signs = self.qjl.encode(residual)
+            qjl_signs, residual_norms = self.qjl.encode(residual)
             meta["qjl_signs"] = qjl_signs.reshape(batch, seq, heads, -1)
+            meta["qjl_residual_norms"] = residual_norms.reshape(batch, seq, heads)
 
         # Store outlier data
         if outlier_data is not None:
@@ -283,10 +284,18 @@ class TurboQuantizer:
         # Apply QJL correction
         if self.qjl is not None and meta.get("qjl_signs") is not None:
             qjl_signs = meta["qjl_signs"].reshape(-1, meta["qjl_signs"].shape[-1])
-            correction = self.qjl.decode_correction(qjl_signs)
-            # Trim or pad correction to match reconstructed dim
-            if correction.shape[-1] != reconstructed.shape[-1]:
-                correction = correction[..., :reconstructed.shape[-1]]
+            # Pass residual norms for proper scaling (None = backward compat)
+            residual_norms = None
+            if meta.get("qjl_residual_norms") is not None:
+                residual_norms = meta["qjl_residual_norms"].reshape(-1)
+            correction = self.qjl.decode_correction(qjl_signs, residual_norms)
+            # Match dimensions: QJL operates on padded dim, reconstructed on original
+            rdim = reconstructed.shape[-1]
+            cdim = correction.shape[-1]
+            if cdim > rdim:
+                correction = correction[..., :rdim]
+            elif cdim < rdim:
+                correction = torch.nn.functional.pad(correction, (0, rdim - cdim))
             reconstructed = reconstructed + correction
 
         # Restore outlier channels
