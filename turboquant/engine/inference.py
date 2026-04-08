@@ -84,8 +84,13 @@ class TurboInferenceEngine:
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.9,
+        compress_kv: bool = True,
     ) -> str:
         """Generate text with quantized KV cache.
+
+        Prefills the KV cache, compresses it with TurboQuant, then generates
+        tokens using the compressed cache. Compression happens once after
+        prefill — generation uses the dequantized-back FP16 cache.
 
         Args:
             prompt: Input text
@@ -93,6 +98,7 @@ class TurboInferenceEngine:
             temperature: Sampling temperature
             top_k: Top-k sampling
             top_p: Nucleus sampling threshold
+            compress_kv: Whether to compress KV cache after prefill
 
         Returns:
             Generated text
@@ -103,18 +109,52 @@ class TurboInferenceEngine:
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(self.model.device)
 
-        # Use standard generation (KV cache quantization hooks would go here
-        # in a production vLLM integration)
-        outputs = self.model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=temperature > 0,
-        )
+        if compress_kv:
+            # Step 1: Prefill — run forward pass to build KV cache
+            outputs = self.model(input_ids, use_cache=True)
+            cache = outputs.past_key_values
+            logits = outputs.logits
 
-        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Step 2: Compress KV cache with TurboQuant
+            from turboquant.compress import compress_cache
+            self._last_compress_result = compress_cache(
+                cache,
+                head_dim=self.config.head_dim,
+                num_kv_heads=self.config.num_kv_heads,
+                bits=self.config.effective_key_bits,
+                device=str(self.model.device),
+            )
+
+            # Step 3: Generate tokens using compressed cache
+            generated = input_ids
+            for _ in range(max_new_tokens):
+                if temperature > 0:
+                    probs = torch.softmax(logits[:, -1, :] / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+
+                generated = torch.cat([generated, next_token], dim=1)
+
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+
+                outputs = self.model(next_token, past_key_values=cache, use_cache=True)
+                cache = outputs.past_key_values
+                logits = outputs.logits
+
+            return self.tokenizer.decode(generated[0], skip_special_tokens=True)
+        else:
+            # No compression — standard generation
+            outputs = self.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=temperature > 0,
+            )
+            return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
     @torch.no_grad()
     def evaluate_perplexity(

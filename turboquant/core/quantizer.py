@@ -186,8 +186,8 @@ class TurboQuantizer:
         if self.mixed_precision is not None and is_key:
             x_flat, outlier_data = self.mixed_precision.extract_outliers(x_flat)
 
-        # PolarQuant encode
-        encoded = polar_quant.encode(x_flat)
+        # PolarQuant encode (with packing for real compression)
+        encoded = polar_quant.encode(x_flat, pack=True)
         meta["magnitudes"] = encoded.magnitudes.reshape(batch, seq, heads)
 
         # QJL residual correction
@@ -204,7 +204,12 @@ class TurboQuantizer:
             meta["outlier_indices"] = outlier_data["indices"]
             meta["outlier_values"] = outlier_data["values"].reshape(batch, seq, heads, -1)
 
-        quantized = encoded.quantized_indices.reshape(batch, seq, heads, -1)
+        # Store packed data (uint8) for real compression, with shape_info for unpacking
+        if encoded.packed_data is not None:
+            meta["packed_shape_info"] = encoded.shape_info
+            quantized = encoded.packed_data.reshape(batch, seq, heads, -1)
+        else:
+            quantized = encoded.quantized_indices.reshape(batch, seq, heads, -1)
         return quantized, meta
 
     def _encode_onebit(
@@ -275,9 +280,14 @@ class TurboQuantizer:
         from turboquant.core.polar_quant import PolarQuantOutput
         encoded = PolarQuantOutput(
             magnitudes=meta["magnitudes"].reshape(-1).float(),
-            quantized_indices=quantized_flat,
+            quantized_indices=quantized_flat if "packed_shape_info" not in meta else None,
             original_dim=self.config.head_dim,
         )
+        # If data was packed, set packed fields for decode
+        if "packed_shape_info" in meta:
+            encoded.packed_data = quantized_flat.reshape(-1)
+            encoded.shape_info = meta["packed_shape_info"]
+            encoded.quantized_indices = None
 
         reconstructed = polar_quant.decode(encoded)
 

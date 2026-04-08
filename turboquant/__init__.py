@@ -10,9 +10,11 @@ __version__ = "0.1.0"
 from turboquant.config import TurboQuantConfig
 from turboquant.core.quantizer import TurboQuantizer
 from turboquant.core.kv_cache import QuantizedKVCache
+from turboquant.compress import compress_cache
 
 __all__ = [
     "TurboQuantConfig",
     "TurboQuantizer",
     "QuantizedKVCache",
+    "compress_cache",
 ]
