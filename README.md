@@ -84,6 +84,30 @@ TurboQuant compresses that 4.6 GB KV cache down to **1.2 GB at 4-bit** with zero
 
 Quality stable from 1K to 32K -- zero degradation with context length.
 
+### Needle-in-a-Haystack v2 (Bonsai-8B 1-bit + TurboQuant, MLX)
+
+End-to-end: `load_bonsai_1bit()` -> prefill -> `compress_cache()` with TurboQuant -> generate.
+Real text from CNN/DailyMail. 3 difficulties per context. Hard questions include distractor facts.
+
+**Model: Bonsai-8B (1-bit weights) | Hardware: M2 Pro 16GB**
+
+| Config | 4K (3) | Accuracy | Cosine | Compression |
+|--------|--------|----------|--------|-------------|
+| FP16 baseline | **3/3** | **100%** | — | — |
+| TurboQuant 4-bit | **3/3** | **100%** | 0.9914 | **2.0x** |
+| TurboQuant 3-bit | **3/3** | **100%** | 0.9667 | **2.7x** |
+
+100% retrieval accuracy at all bit widths. Compression ratio measured from actual `.nbytes` (FP16 -> uint8 indices + float16 norms).
+
+**GGUF Needle-in-a-Haystack (Bonsai-8B via llama.cpp, 1K to 32K)**
+
+| Config | 1K | 4K | 8K | 16K | 32K | Total |
+|--------|----|----|----|----|-----|-------|
+| FP16 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **15/15** |
+| Q4_0 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | **15/15** |
+
+Zero retrieval loss at 4-bit across 5 context lengths with hard distractors.
+
 ---
 
 ## Performance
@@ -292,6 +316,8 @@ turboquant-vllm/
 │       └── inference.py            # HuggingFace integration
 ├── tests/                          # 161 tests, 90% coverage
 ├── benchmarks/
+│   ├── needle_v2_mlx_turboquant.py # Needle-in-a-Haystack v2 (MLX + TurboQuant, 1K-60K)
+│   ├── needle_haystack_v2.py       # Needle-in-a-Haystack v2 (GGUF, 1K-60K)
 │   ├── full_kv_benchmark.py        # 20Q benchmark (Bonsai-8B, Qwen3.5-9B)
 │   ├── full_report_benchmark.py    # Full report with context scaling
 │   ├── smoke_test.py               # Quick 5Q comparison
