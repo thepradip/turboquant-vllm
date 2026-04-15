@@ -19,11 +19,32 @@ from __future__ import annotations
 
 import logging
 import torch
-from typing import Any, Optional
+from dataclasses import fields
+from typing import Any, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
 _registered = False
+_runtime_patch_attempted = False
+
+_TURBOQUANT_KV_DTYPES = {"turboquant", "turboquant_4bit", "turboquant_3bit"}
+
+
+def _ensure_runtime_patch() -> None:
+    """Patch vLLM runtime hooks only when TurboQuant KV storage is requested."""
+    global _runtime_patch_attempted
+    if _runtime_patch_attempted:
+        return
+
+    try:
+        from turboquant.vllm_tq4_runtime import patch_vllm_tq4_runtime
+
+        patch_vllm_tq4_runtime()
+        _runtime_patch_attempted = True
+    except ImportError as exc:
+        logger.debug("TurboQuant runtime patch unavailable: %s", exc)
+    except Exception as exc:
+        logger.warning("TurboQuant runtime patch failed: %s", exc)
 
 
 def register():
@@ -36,6 +57,7 @@ def register():
     try:
         _register_quantization()
         _register_cache_dtype()
+        _ensure_runtime_patch()
         logger.info("TurboQuant KV cache quantization registered with vLLM")
     except ImportError as e:
         logger.debug(f"vLLM not available, skipping plugin registration: {e}")
@@ -111,6 +133,7 @@ def _register_quantization():
             from vllm.attention import Attention
 
             if isinstance(layer, Attention):
+                _ensure_runtime_patch()
                 return TurboQuantKVCacheMethod(self)
             return None
 
@@ -199,13 +222,82 @@ def _register_quantization():
 
 def _register_cache_dtype():
     """Register 'turboquant' as a valid kv_cache_dtype in vLLM."""
+    turboquant_cache_dtype = Literal[
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "fp8_inc",
+        "fp8_ds_mla",
+        "turboquant",
+        "turboquant_4bit",
+        "turboquant_3bit",
+    ]
+
+    try:
+        import pydantic.dataclasses
+        import vllm.config.cache as cache_config
+
+        cache_config.CacheDType = turboquant_cache_dtype
+        cache_config.CacheConfig.__annotations__["cache_dtype"] = turboquant_cache_dtype
+        for field in fields(cache_config.CacheConfig):
+            if field.name == "cache_dtype":
+                field.type = turboquant_cache_dtype
+                break
+        pydantic.dataclasses.rebuild_dataclass(
+            cache_config.CacheConfig, force=True
+        )
+    except (ImportError, AttributeError, TypeError) as exc:
+        logger.debug("Could not patch vLLM CacheConfig CacheDType: %s", exc)
+
+    try:
+        import vllm.v1.attention.backend as attention_backend
+        import vllm.v1.attention.selector as attention_selector
+
+        attention_backend.CacheDType = turboquant_cache_dtype
+        attention_selector.CacheDType = turboquant_cache_dtype
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Could not patch vLLM attention CacheDType: %s", exc)
+
+    # Keep the custom dtype string alive through vLLM config resolution. The
+    # packed KV runtime hook patches the Triton backend to allocate uint8 pages
+    # and decode them to fp16 scratch before attention.
+    try:
+        import vllm.engine.arg_utils as arg_utils
+        import vllm.utils.torch_utils as torch_utils
+
+        if not getattr(torch_utils, "_turboquant_dtype_resolution_patched", False):
+            _orig_resolve = torch_utils.resolve_kv_cache_dtype_string
+
+            def _patched_resolve_kv_cache_dtype_string(
+                kv_cache_dtype: str, model_config: Any
+            ) -> str:
+                if kv_cache_dtype in _TURBOQUANT_KV_DTYPES:
+                    _ensure_runtime_patch()
+                    return kv_cache_dtype
+                return _orig_resolve(kv_cache_dtype, model_config)
+
+            torch_utils.resolve_kv_cache_dtype_string = (
+                _patched_resolve_kv_cache_dtype_string
+            )
+            torch_utils._turboquant_dtype_resolution_patched = True
+
+        arg_utils.resolve_kv_cache_dtype_string = (
+            torch_utils.resolve_kv_cache_dtype_string
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Could not patch vLLM KV dtype resolution: %s", exc)
+
     try:
         from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
-        # TurboQuant stores quantized data as int16 (codebook indices)
-        STR_DTYPE_TO_TORCH_DTYPE["turboquant"] = torch.int16
-        STR_DTYPE_TO_TORCH_DTYPE["turboquant_4bit"] = torch.int16
-        STR_DTYPE_TO_TORCH_DTYPE["turboquant_3bit"] = torch.int16
+        # Packed TQ4 stores two codebook indices per byte plus fp16 magnitude
+        # metadata bytes in the same uint8 page.
+        STR_DTYPE_TO_TORCH_DTYPE["turboquant"] = torch.uint8
+        STR_DTYPE_TO_TORCH_DTYPE["turboquant_4bit"] = torch.uint8
+        STR_DTYPE_TO_TORCH_DTYPE["turboquant_3bit"] = torch.uint8
     except (ImportError, AttributeError):
         pass
 
