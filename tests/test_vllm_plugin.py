@@ -253,3 +253,120 @@ def test_fused_decode_matches_reference_attention(seq_len, block_size, num_block
     max_abs_err = (fused_output - ref).abs().max().item()
     mean_abs_err = (fused_output - ref).abs().mean().item()
     assert max_abs_err < 0.25, f"max_abs_err={max_abs_err:.4f}, mean_abs_err={mean_abs_err:.4f}"
+
+
+def test_decode_referenced_kv_cache_reuses_clean_blocks(monkeypatch):
+    runtime = importlib.import_module("turboquant.vllm_tq4_runtime")
+    runtime._DECODE_CACHE_STATE.clear()
+
+    torch.manual_seed(0)
+    block_size = 4
+    num_blocks = 3
+    num_kv_heads = 2
+    head_size = 8
+    packed_width = runtime.packed_tq4_width(head_size)
+    dtype = torch.float16
+
+    kv_cache = torch.zeros(
+        num_blocks, 2, block_size, num_kv_heads, packed_width, dtype=torch.uint8
+    )
+    key = torch.randn(num_blocks * block_size, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn_like(key)
+    slot_mapping = torch.arange(num_blocks * block_size, dtype=torch.long)
+    runtime.tq4_cache_update(key, value, kv_cache, slot_mapping)
+
+    block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+    decode_calls = []
+    original_decode = runtime.decode_tq4_kv_cache
+
+    def wrapped_decode(*args, **kwargs):
+        decode_calls.append(args[0].shape[0])
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "decode_tq4_kv_cache", wrapped_decode)
+
+    decoded_first, compact_first = runtime.decode_tq4_referenced_kv_cache(
+        kv_cache, block_table, head_size=head_size, dtype=dtype
+    )
+    decoded_second, compact_second = runtime.decode_tq4_referenced_kv_cache(
+        kv_cache, block_table, head_size=head_size, dtype=dtype
+    )
+
+    assert decode_calls == [3]
+    assert torch.equal(compact_first, compact_second)
+    assert torch.allclose(decoded_first, decoded_second)
+
+
+def test_decode_referenced_kv_cache_invalidates_only_written_blocks(monkeypatch):
+    runtime = importlib.import_module("turboquant.vllm_tq4_runtime")
+    runtime._DECODE_CACHE_STATE.clear()
+
+    torch.manual_seed(0)
+    block_size = 4
+    num_blocks = 3
+    num_kv_heads = 2
+    head_size = 8
+    packed_width = runtime.packed_tq4_width(head_size)
+    dtype = torch.float16
+
+    kv_cache = torch.zeros(
+        num_blocks, 2, block_size, num_kv_heads, packed_width, dtype=torch.uint8
+    )
+    key = torch.randn(num_blocks * block_size, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn_like(key)
+    slot_mapping = torch.arange(num_blocks * block_size, dtype=torch.long)
+    runtime.tq4_cache_update(key, value, kv_cache, slot_mapping)
+
+    block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+    runtime.decode_tq4_referenced_kv_cache(
+        kv_cache, block_table, head_size=head_size, dtype=dtype
+    )
+
+    decode_calls = []
+    original_decode = runtime.decode_tq4_kv_cache
+
+    def wrapped_decode(*args, **kwargs):
+        decode_calls.append(args[0].shape[0])
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(runtime, "decode_tq4_kv_cache", wrapped_decode)
+
+    updated_key = torch.randn(block_size, num_kv_heads, head_size, dtype=dtype)
+    updated_value = torch.randn_like(updated_key)
+    updated_slots = torch.arange(block_size, 2 * block_size, dtype=torch.long)
+    runtime.tq4_cache_update(updated_key, updated_value, kv_cache, updated_slots)
+    decoded_after, _ = runtime.decode_tq4_referenced_kv_cache(
+        kv_cache, block_table, head_size=head_size, dtype=dtype
+    )
+
+    assert decode_calls == [1]
+    decoded_block = runtime.decode_tq4_kv_cache(
+        kv_cache.index_select(0, torch.tensor([1])),
+        head_size=head_size,
+        dtype=dtype,
+    )[0]
+    assert torch.allclose(decoded_after[1], decoded_block)
+
+
+def test_decode_referenced_kv_cache_handles_empty_block_table():
+    runtime = importlib.import_module("turboquant.vllm_tq4_runtime")
+    runtime._DECODE_CACHE_STATE.clear()
+
+    block_size = 4
+    num_blocks = 2
+    num_kv_heads = 2
+    head_size = 8
+    packed_width = runtime.packed_tq4_width(head_size)
+    dtype = torch.float16
+
+    kv_cache = torch.zeros(
+        num_blocks, 2, block_size, num_kv_heads, packed_width, dtype=torch.uint8
+    )
+    block_table = torch.full((1, 3), -1, dtype=torch.int32)
+
+    decoded, compact = runtime.decode_tq4_referenced_kv_cache(
+        kv_cache, block_table, head_size=head_size, dtype=dtype
+    )
+
+    assert decoded.shape == (0, 2, block_size, num_kv_heads, head_size)
+    assert torch.equal(compact, block_table)
