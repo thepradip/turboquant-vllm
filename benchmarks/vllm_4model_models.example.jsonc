@@ -1,0 +1,28 @@
+{
+  "models": [
+    {
+      "label": "qwen3.5-4b",
+      "model": "/mnt/hf-models/qwen3.5-4b-awq-4bit",
+      "tokenizer": "/mnt/hf-models/qwen3.5-4b-awq-4bit",
+      "weight_quantization": "auto"
+    },
+    {
+      "label": "qwen3.5-9b",
+      "model": "/mnt/hf-models/qwen3.5-9b-awq-4bit",
+      "tokenizer": "/mnt/hf-models/qwen3.5-9b-awq-4bit",
+      "weight_quantization": "auto"
+    },
+    {
+      "label": "gemma-4-e4b-it",
+      "model": "/mnt/hf-models/gemma-4-e4b-it-gptq-4bit",
+      "tokenizer": "/mnt/hf-models/gemma-4-e4b-it-gptq-4bit",
+      "weight_quantization": "gptq"
+    },
+    {
+      "label": "llama-3.1-8b-instruct",
+      "model": "/mnt/hf-models/llama-3.1-8b-instruct-awq-int4",
+      "tokenizer": "/mnt/hf-models/llama-3.1-8b-instruct-awq-int4",
+      "weight_quantization": "awq"
+    }
+  ]
+}
