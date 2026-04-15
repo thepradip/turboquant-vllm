@@ -33,6 +33,7 @@ _FUSED_DECODE_ENV = "TURBOQUANT_FUSED_DECODE"
 _FUSED_DEBUG_ENV = "TURBOQUANT_DEBUG_FUSED"
 _PATH_DEBUG_ENV = "TURBOQUANT_DEBUG_PATHS"
 _COMPARE_ENV = "TURBOQUANT_DEBUG_COMPARE"
+_DECODE_CACHE_STATE: dict[tuple[int, torch.device, torch.dtype, int], dict[str, Any]] = {}
 
 
 def _debug_paths_enabled() -> bool:
@@ -111,7 +112,7 @@ def _device_params(
     device_index: int,
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    device = torch.device(device_type, device_index)
+    device = torch.device(device_type) if device_index < 0 else torch.device(device_type, device_index)
     padded_dim = 1 << (head_size - 1).bit_length() if head_size & (head_size - 1) else head_size
     codebook, boundaries = _cpu_codebook_and_boundaries(head_size)
     signs = _cpu_signs(head_size, seed)
@@ -202,6 +203,58 @@ def _magnitude_to_bytes(magnitudes: torch.Tensor) -> torch.Tensor:
 
 def _bytes_to_magnitude(raw: torch.Tensor) -> torch.Tensor:
     return raw.contiguous().view(torch.float16).squeeze(-1)
+
+
+def _decode_cache_key(
+    kv_cache: torch.Tensor,
+    *,
+    head_size: int,
+    dtype: torch.dtype,
+) -> tuple[int, torch.device, torch.dtype, int]:
+    return (kv_cache.data_ptr(), kv_cache.device, dtype, head_size)
+
+
+def _get_decode_cache_state(
+    kv_cache: torch.Tensor,
+    *,
+    head_size: int,
+    dtype: torch.dtype,
+) -> dict[str, Any]:
+    key = _decode_cache_key(kv_cache, head_size=head_size, dtype=dtype)
+    state = _DECODE_CACHE_STATE.get(key)
+    expected_shape = tuple(kv_cache.shape)
+    if state is None or state["kv_shape"] != expected_shape:
+        num_blocks = kv_cache.shape[0]
+        state = {
+            "kv_shape": expected_shape,
+            "block_versions": torch.zeros(num_blocks, dtype=torch.int64, device=kv_cache.device),
+            "decoded_versions": torch.full((num_blocks,), -1, dtype=torch.int64, device=kv_cache.device),
+            "decoded_cache": torch.empty(
+                num_blocks,
+                2,
+                kv_cache.shape[2],
+                kv_cache.shape[3],
+                head_size,
+                dtype=dtype,
+                device=kv_cache.device,
+            ),
+        }
+        _DECODE_CACHE_STATE[key] = state
+    return state
+
+
+def _mark_tq4_blocks_dirty(kv_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+    if slot_mapping.numel() == 0:
+        return
+    block_size = kv_cache.shape[2]
+    block_ids = torch.unique(slot_mapping.to(torch.long) // block_size)
+    if block_ids.numel() == 0:
+        return
+    for cache_key, state in list(_DECODE_CACHE_STATE.items()):
+        cache_ptr, cache_device, _, _ = cache_key
+        if cache_ptr != kv_cache.data_ptr() or cache_device != kv_cache.device:
+            continue
+        state["block_versions"][block_ids] += 1
 
 
 if triton is not None:
@@ -693,6 +746,7 @@ def tq4_cache_update(
     encoded_value = encode_tq4(value, seed=43)
     key_flat.index_copy_(0, slot_mapping, encoded_key)
     value_flat.index_copy_(0, slot_mapping, encoded_value)
+    _mark_tq4_blocks_dirty(kv_cache, slot_mapping)
 
     if _debug_compare_enabled() and slot_mapping.numel() > 0:
         sample_n = min(4, int(slot_mapping.numel()))
@@ -729,13 +783,39 @@ def decode_tq4_referenced_kv_cache(
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     used = torch.unique(block_table[block_table >= 0]).to(torch.long)
+    if used.numel() == 0:
+        compact_shape = (
+            0,
+            kv_cache.shape[1],
+            kv_cache.shape[2],
+            kv_cache.shape[3],
+            head_size,
+        )
+        return (
+            torch.empty(compact_shape, dtype=dtype, device=kv_cache.device),
+            block_table.clone(),
+        )
     _debug_log_path(
         "decode_referenced_cache "
         f"kv_cache={tuple(kv_cache.shape)} used_blocks={int(used.numel())} "
         f"block_table={tuple(block_table.shape)} head_size={head_size}"
     )
-    compact_cache = kv_cache.index_select(0, used)
-    decoded = decode_tq4_kv_cache(compact_cache, head_size=head_size, dtype=dtype)
+    state = _get_decode_cache_state(kv_cache, head_size=head_size, dtype=dtype)
+    block_versions = state["block_versions"]
+    decoded_versions = state["decoded_versions"]
+    dirty_mask = decoded_versions.index_select(0, used) != block_versions.index_select(0, used)
+    dirty_blocks = used[dirty_mask]
+
+    if dirty_blocks.numel() > 0:
+        compact_cache = kv_cache.index_select(0, dirty_blocks)
+        state["decoded_cache"].index_copy_(
+            0,
+            dirty_blocks,
+            decode_tq4_kv_cache(compact_cache, head_size=head_size, dtype=dtype),
+        )
+        decoded_versions.index_copy_(0, dirty_blocks, block_versions.index_select(0, dirty_blocks))
+
+    decoded = state["decoded_cache"].index_select(0, used)
 
     remap = torch.empty(int(used.max().item()) + 1, dtype=torch.long, device=block_table.device)
     remap[used] = torch.arange(used.numel(), dtype=torch.long, device=block_table.device)
