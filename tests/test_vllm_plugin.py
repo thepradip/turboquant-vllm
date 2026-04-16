@@ -9,6 +9,54 @@ import turboquant.vllm_plugin as vllm_plugin
 from turboquant.vllm_plugin import TurboQuantKVHook
 
 
+FUSED_DECODE_MODEL_PROFILES = [
+    {
+        "label": "qwen3.5-4b",
+        "seq_len": 24,
+        "block_size": 16,
+        "num_blocks": 2,
+        "num_heads": 16,
+        "num_kv_heads": 4,
+        "head_size": 256,
+        "sliding_window": (-1, 0),
+        "logits_soft_cap": 0.0,
+    },
+    {
+        "label": "qwen3.5-9b",
+        "seq_len": 1024,
+        "block_size": 16,
+        "num_blocks": 64,
+        "num_heads": 16,
+        "num_kv_heads": 4,
+        "head_size": 256,
+        "sliding_window": (-1, 0),
+        "logits_soft_cap": 0.0,
+    },
+    {
+        "label": "gemma-4-e4b-it",
+        "seq_len": 768,
+        "block_size": 16,
+        "num_blocks": 48,
+        "num_heads": 8,
+        "num_kv_heads": 2,
+        "head_size": 256,
+        "sliding_window": (511, 0),
+        "logits_soft_cap": 0.0,
+    },
+    {
+        "label": "bonsai-8b-1bit",
+        "seq_len": 1024,
+        "block_size": 16,
+        "num_blocks": 64,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "head_size": 128,
+        "sliding_window": (-1, 0),
+        "logits_soft_cap": 0.0,
+    },
+]
+
+
 class TestTurboQuantKVHook:
     """Test the standalone KV hook (works without vLLM installed)."""
 
@@ -156,14 +204,11 @@ class TestPluginRegistration:
 
 @pytest.mark.gpu
 @pytest.mark.parametrize(
-    ("seq_len", "block_size", "num_blocks"),
-    [
-        (8, 16, 1),
-        (24, 16, 2),
-        (1024, 16, 64),
-    ],
+    "profile",
+    FUSED_DECODE_MODEL_PROFILES,
+    ids=[profile["label"] for profile in FUSED_DECODE_MODEL_PROFILES],
 )
-def test_fused_decode_matches_reference_attention(seq_len, block_size, num_blocks):
+def test_fused_decode_matches_reference_attention(profile):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
@@ -173,9 +218,12 @@ def test_fused_decode_matches_reference_attention(seq_len, block_size, num_block
 
     torch.manual_seed(0)
     device = torch.device("cuda")
-    num_heads = 16
-    num_kv_heads = 4
-    head_size = 128
+    seq_len = profile["seq_len"]
+    block_size = profile["block_size"]
+    num_blocks = profile["num_blocks"]
+    num_heads = profile["num_heads"]
+    num_kv_heads = profile["num_kv_heads"]
+    head_size = profile["head_size"]
     packed_width = runtime.packed_tq4_width(head_size)
     dtype = torch.float16
 
@@ -210,10 +258,10 @@ def test_fused_decode_matches_reference_attention(seq_len, block_size, num_block
         head_size=head_size,
         num_heads=num_heads,
         num_queries_per_kv=num_heads // num_kv_heads,
-        sliding_window=(-1, -1),
+        sliding_window=profile["sliding_window"],
         alibi_slopes=None,
         sinks=None,
-        logits_soft_cap=0.0,
+        logits_soft_cap=profile["logits_soft_cap"],
         scale=head_size ** -0.5,
     )
 
@@ -240,14 +288,117 @@ def test_fused_decode_matches_reference_attention(seq_len, block_size, num_block
 
     ref = torch.empty_like(query)
     num_queries_per_kv = num_heads // num_kv_heads
+    effective_window = impl.sliding_window[0] + 1 if impl.sliding_window[0] >= 0 else 0
+    start = max(0, seq_len - effective_window) if effective_window > 0 else 0
     for q_head in range(num_heads):
         kv_head = q_head // num_queries_per_kv
         scores = torch.matmul(
-            decoded_keys[:, kv_head], query[0, q_head]
+            decoded_keys[start:, kv_head], query[0, q_head]
         ) * impl.scale
+        if impl.logits_soft_cap:
+            scores = impl.logits_soft_cap * torch.tanh(scores / impl.logits_soft_cap)
         probs = torch.softmax(scores.float(), dim=0).to(dtype)
         ref[0, q_head] = torch.sum(
-            decoded_values[:, kv_head] * probs[:, None], dim=0
+            decoded_values[start:, kv_head] * probs[:, None], dim=0
+        )
+
+    max_abs_err = (fused_output - ref).abs().max().item()
+    mean_abs_err = (fused_output - ref).abs().mean().item()
+    assert max_abs_err < 0.25, f"max_abs_err={max_abs_err:.4f}, mean_abs_err={mean_abs_err:.4f}"
+
+
+@pytest.mark.gpu
+def test_fused_decode_matches_reference_attention_with_logit_soft_cap():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    runtime = importlib.import_module("turboquant.vllm_tq4_runtime")
+    if runtime.triton is None:
+        pytest.skip("Triton runtime unavailable")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    seq_len = 768
+    block_size = 16
+    num_blocks = 48
+    num_heads = 8
+    num_kv_heads = 2
+    head_size = 256
+    logits_soft_cap = 50.0
+    packed_width = runtime.packed_tq4_width(head_size)
+    dtype = torch.float16
+
+    query = torch.randn(1, num_heads, head_size, device=device, dtype=dtype)
+    key = torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=dtype)
+    value = torch.randn(seq_len, num_kv_heads, head_size, device=device, dtype=dtype)
+
+    kv_cache = torch.zeros(
+        num_blocks,
+        2,
+        block_size,
+        num_kv_heads,
+        packed_width,
+        device=device,
+        dtype=torch.uint8,
+    )
+    slot_mapping = torch.arange(seq_len, device=device, dtype=torch.long)
+    runtime.tq4_cache_update(key, value, kv_cache, slot_mapping)
+
+    attn_metadata = SimpleNamespace(
+        block_table=torch.tensor(
+            [list(range(num_blocks))], device=device, dtype=torch.int32
+        ),
+        seq_lens=torch.tensor([seq_len], device=device, dtype=torch.int32),
+        query_start_loc=torch.tensor([0], device=device, dtype=torch.int32),
+        max_query_len=1,
+        num_actual_tokens=1,
+        use_cascade=False,
+        mm_prefix_range=None,
+    )
+    impl = SimpleNamespace(
+        head_size=head_size,
+        num_heads=num_heads,
+        num_queries_per_kv=num_heads // num_kv_heads,
+        sliding_window=(511, 0),
+        alibi_slopes=None,
+        sinks=None,
+        logits_soft_cap=logits_soft_cap,
+        scale=head_size ** -0.5,
+    )
+
+    fused_output = torch.empty_like(query)
+    used_fused = runtime._try_fused_tq4_decode_attention(
+        impl,
+        query,
+        kv_cache,
+        attn_metadata,
+        fused_output,
+        None,
+        None,
+    )
+    assert used_fused, "Expected fused decode path with logit soft cap to run"
+
+    decoded_cache, _ = runtime.decode_tq4_referenced_kv_cache(
+        kv_cache,
+        attn_metadata.block_table,
+        head_size=head_size,
+        dtype=dtype,
+    )
+    decoded_keys = decoded_cache[0, 0]
+    decoded_values = decoded_cache[0, 1]
+    start = seq_len - 512
+
+    ref = torch.empty_like(query)
+    num_queries_per_kv = num_heads // num_kv_heads
+    for q_head in range(num_heads):
+        kv_head = q_head // num_queries_per_kv
+        scores = torch.matmul(
+            decoded_keys[start:, kv_head], query[0, q_head]
+        ) * impl.scale
+        scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
+        probs = torch.softmax(scores.float(), dim=0).to(dtype)
+        ref[0, q_head] = torch.sum(
+            decoded_values[start:, kv_head] * probs[:, None], dim=0
         )
 
     max_abs_err = (fused_output - ref).abs().max().item()

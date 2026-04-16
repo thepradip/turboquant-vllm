@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover - vLLM may not be installed.
 
 META_BYTES = 2  # fp16 magnitude per token/head
 TQ4_DTYPES = {"turboquant", "turboquant_4bit"}
+_FUSED_HEAD_SIZES = frozenset({64, 128, 256})
 _COMPILE_ENV = "TURBOQUANT_COMPILE_POLAR"
 _FUSED_DECODE_ENV = "TURBOQUANT_FUSED_DECODE"
 _FUSED_DEBUG_ENV = "TURBOQUANT_DEBUG_FUSED"
@@ -205,6 +206,10 @@ def _bytes_to_magnitude(raw: torch.Tensor) -> torch.Tensor:
     return raw.contiguous().view(torch.float16).squeeze(-1)
 
 
+def _supports_fused_tq4_decode(head_size: int, head_size_v: int) -> bool:
+    return head_size in _FUSED_HEAD_SIZES and head_size_v == head_size
+
+
 def _decode_cache_key(
     kv_cache: torch.Tensor,
     *,
@@ -272,6 +277,10 @@ if triton is not None:
             + (((rows >> 7) & 1) * ((cols >> 7) & 1))
         ) & 1
         return 1.0 - 2.0 * parity.to(tl.float32)
+
+    @triton.jit
+    def _tanh(x):
+        return 2 * tl.sigmoid(2 * x) - 1
 
     @triton.jit
     def _load_tq4_tile(
@@ -374,6 +383,7 @@ if triton is not None:
         TILE_SIZE: tl.constexpr,
         SLIDING_WINDOW: tl.constexpr,
         INV_SQRT_HEAD: tl.constexpr,
+        LOGIT_CAP: tl.constexpr,
     ):
         seq_idx = tl.program_id(0)
         query_head_idx = tl.program_id(1)
@@ -471,6 +481,8 @@ if triton is not None:
 
             scores = tl.sum(q_rot[:, None] * k_rot, axis=0)
             scores = scores * k_scale * softmax_scale
+            if LOGIT_CAP > 0:
+                scores = LOGIT_CAP * _tanh(scores / LOGIT_CAP)
             scores = tl.where(tile_mask, scores, float("-inf"))
 
             m_new = tl.maximum(m_i, tl.max(scores, axis=0))
@@ -600,6 +612,7 @@ if triton is not None:
         D_CHUNK: tl.constexpr,
         SLIDING_WINDOW: tl.constexpr,
         INV_SQRT_HEAD: tl.constexpr,
+        LOGIT_CAP: tl.constexpr,
     ):
         seq_idx = tl.program_id(0)
         query_head_idx = tl.program_id(1)
@@ -670,6 +683,8 @@ if triton is not None:
                 scores += tl.sum(q_rot[:, None] * k_rot, axis=0)
 
             scores = scores * k_scale * softmax_scale
+            if LOGIT_CAP > 0:
+                scores = LOGIT_CAP * _tanh(scores / LOGIT_CAP)
             scores = tl.where(tile_mask, scores, float("-inf"))
 
             m_new = tl.maximum(m_i, tl.max(scores, axis=0))
@@ -916,7 +931,7 @@ def _try_fused_tq4_decode_attention(
         return reject("env disabled")
     if output_scale is not None or output_block_scale is not None:
         return reject("output quantization requested")
-    if self.head_size not in (128, 256) or getattr(self, "head_size_v", self.head_size) != self.head_size:
+    if not _supports_fused_tq4_decode(self.head_size, getattr(self, "head_size_v", self.head_size)):
         return reject(f"unsupported head size {self.head_size}")
     if getattr(attn_metadata, "max_query_len", 0) != 1:
         return reject(f"max_query_len={getattr(attn_metadata, 'max_query_len', None)}")
@@ -926,8 +941,6 @@ def _try_fused_tq4_decode_attention(
         return reject("alibi")
     if getattr(self, "sinks", None) is not None:
         return reject("sinks")
-    if getattr(self, "logits_soft_cap", 0) not in (0, 0.0, None):
-        return reject("softcap")
     if getattr(attn_metadata, "mm_prefix_range", None) is not None:
         return reject("mm prefix")
 
@@ -970,6 +983,7 @@ def _try_fused_tq4_decode_attention(
             TILE_SIZE=8,
             SLIDING_WINDOW=sliding_window,
             INV_SQRT_HEAD=self.head_size ** -0.5,
+            LOGIT_CAP=float(getattr(self, "logits_soft_cap", 0.0) or 0.0),
         )
         if self.head_size == 256:
             kwargs["D_CHUNK"] = 32
